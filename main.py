@@ -44,6 +44,7 @@ class StatusSnapshot:
     internet_online: bool
     tailscale_state: str
     tailscale_ip: str
+    current_time: str
     updated_at: str
 
 
@@ -212,16 +213,19 @@ def tailscale_status():
 def collect_status(internet_timeout: float) -> StatusSnapshot:
     mode, connection, interface, local_ip = network_status()
     tailscale_state, tailscale_ip = tailscale_status()
+    internet_is_online = internet_online(internet_timeout)
+    timestamp = eastern_timestamp()
     return StatusSnapshot(
         ubuntu=ubuntu_version(),
         network_mode=mode,
         network_name=connection,
         interface=interface,
         local_ip=local_ip,
-        internet_online=internet_online(internet_timeout),
+        internet_online=internet_is_online,
         tailscale_state=tailscale_state,
         tailscale_ip=tailscale_ip,
-        updated_at=eastern_timestamp(),
+        current_time=timestamp,
+        updated_at=timestamp,
     )
 
 
@@ -259,7 +263,7 @@ def render_status(status: StatusSnapshot) -> Image.Image:
     draw.rectangle((0, 0, WIDTH, 58), fill=navy)
     ubuntu = fit_text(draw, status.ubuntu, font_header, WIDTH - 22)
     draw.text((11, 7), ubuntu, fill="white", font=font_header)
-    draw.text((12, 35), status.updated_at, fill=(185, 208, 231), font=font_body)
+    draw.text((12, 35), status.current_time, fill=(185, 208, 231), font=font_body)
 
     draw.rectangle((8, 67, WIDTH - 8, 165), fill="white", outline=border)
     draw.text((18, 75), "NETWORK", fill=muted, font=font_label)
@@ -362,7 +366,7 @@ def main() -> None:
                 status = collect_status(args.internet_timeout)
                 next_status_refresh = started + args.status_interval
             else:
-                status = replace(status, updated_at=eastern_timestamp())
+                status = replace(status, current_time=eastern_timestamp())
 
             display.show(render_status(status))
             if status_refreshed:
