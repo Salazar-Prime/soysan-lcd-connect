@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import signal
 import socket
 import subprocess
 import time
@@ -15,6 +16,9 @@ from typing import List, Optional
 from PIL import Image, ImageDraw
 
 from lcd_driver import HEIGHT, WIDTH, Waveshare2Inch, load_font
+
+
+stop_requested = False
 
 
 @dataclass(frozen=True)
@@ -314,6 +318,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def request_stop(_signum, _frame) -> None:
+    global stop_requested
+    stop_requested = True
+
+
 def main() -> None:
     args = parse_args()
 
@@ -321,12 +330,15 @@ def main() -> None:
         print(json.dumps(asdict(collect_status(args.internet_timeout)), indent=2))
         return
 
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
     display = Waveshare2Inch()
     try:
         display.initialize()
         display.show(render_starting())
 
-        while True:
+        while not stop_requested:
             started = time.monotonic()
             status = collect_status(args.internet_timeout)
             display.show(render_status(status))
@@ -337,7 +349,7 @@ def main() -> None:
                 flush=True,
             )
 
-            if args.once:
+            if args.once or stop_requested:
                 break
             elapsed = time.monotonic() - started
             time.sleep(max(0.1, args.interval - elapsed))

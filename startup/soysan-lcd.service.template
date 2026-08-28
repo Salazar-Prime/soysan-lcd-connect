@@ -1,0 +1,23 @@
+[Unit]
+Description=Soysan LCD connection status
+After=NetworkManager.service tailscaled.service
+Wants=NetworkManager.service
+ConditionPathExists=@PROJECT_DIR@/main.py
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_GROUP@
+SupplementaryGroups=gpio
+WorkingDirectory=@PROJECT_DIR@
+Environment=HOME=@HOME_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=LCD_REFRESH_INTERVAL=5
+ExecStartPre=+/usr/sbin/modprobe spidev
+ExecStart=@PROJECT_DIR@/startup/start_if_ready.sh
+Restart=always
+RestartSec=10
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
