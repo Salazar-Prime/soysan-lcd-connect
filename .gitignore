@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.panepilot/
+.DS_Store
+*.log
