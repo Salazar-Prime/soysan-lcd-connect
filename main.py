@@ -221,7 +221,7 @@ def collect_status(internet_timeout: float) -> StatusSnapshot:
         internet_online=internet_online(internet_timeout),
         tailscale_state=tailscale_state,
         tailscale_ip=tailscale_ip,
-        updated_at=datetime.now().strftime("%I:%M:%S %p %Z"),
+        updated_at=datetime.now().astimezone().strftime("%I:%M:%S %p %Z"),
     )
 
 
