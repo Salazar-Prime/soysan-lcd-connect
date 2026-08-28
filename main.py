@@ -9,7 +9,7 @@ import signal
 import socket
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -221,8 +221,12 @@ def collect_status(internet_timeout: float) -> StatusSnapshot:
         internet_online=internet_online(internet_timeout),
         tailscale_state=tailscale_state,
         tailscale_ip=tailscale_ip,
-        updated_at=datetime.now().astimezone().strftime("%I:%M:%S %p %Z"),
+        updated_at=eastern_timestamp(),
     )
+
+
+def eastern_timestamp() -> str:
+    return datetime.now().astimezone().strftime("%I:%M:%S %p %Z")
 
 
 def fit_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:
@@ -311,8 +315,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interval",
         type=positive_float,
+        default=1.0,
+        help="display refresh interval in seconds (default: 1)",
+    )
+    parser.add_argument(
+        "--status-interval",
+        type=positive_float,
         default=5.0,
-        help="refresh interval in seconds (default: 5)",
+        help="network status refresh interval in seconds (default: 5)",
     )
     parser.add_argument(
         "--internet-timeout",
@@ -343,16 +353,25 @@ def main() -> None:
         display.initialize()
         display.show(render_starting())
 
+        status: Optional[StatusSnapshot] = None
+        next_status_refresh = 0.0
         while not stop_requested:
             started = time.monotonic()
-            status = collect_status(args.internet_timeout)
+            status_refreshed = status is None or started >= next_status_refresh
+            if status_refreshed:
+                status = collect_status(args.internet_timeout)
+                next_status_refresh = started + args.status_interval
+            else:
+                status = replace(status, updated_at=eastern_timestamp())
+
             display.show(render_status(status))
-            print(
-                f"{status.updated_at} network={status.network_mode} "
-                f"ip={status.local_ip} internet={'online' if status.internet_online else 'offline'} "
-                f"tailscale={status.tailscale_state} tailscale_ip={status.tailscale_ip}",
-                flush=True,
-            )
+            if status_refreshed:
+                print(
+                    f"{status.updated_at} network={status.network_mode} "
+                    f"ip={status.local_ip} internet={'online' if status.internet_online else 'offline'} "
+                    f"tailscale={status.tailscale_state} tailscale_ip={status.tailscale_ip}",
+                    flush=True,
+                )
 
             if args.once or stop_requested:
                 break

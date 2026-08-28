@@ -22,4 +22,5 @@ fi
 
 printf 'LCD SPI endpoint ready; starting Soysan status display.\n'
 exec /usr/bin/python3 "${project_dir}/main.py" \
-  --interval "${LCD_REFRESH_INTERVAL:-5}"
+  --interval "${LCD_REFRESH_INTERVAL:-1}" \
+  --status-interval "${LCD_STATUS_INTERVAL:-5}"

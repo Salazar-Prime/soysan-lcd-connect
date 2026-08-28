@@ -5,7 +5,8 @@ Status and utility scripts for the Waveshare 2-inch LCD on the Xavier NX.
 ## Main status screen
 
 `main.py` shows Ubuntu, network mode, local IP, Internet status, and Tailscale
-status. It refreshes every five seconds.
+status. The Eastern time refreshes every second; connection checks refresh every
+five seconds.
 
 ```bash
 ./run_status_display.sh

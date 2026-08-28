@@ -12,7 +12,8 @@ SupplementaryGroups=gpio
 WorkingDirectory=@PROJECT_DIR@
 Environment=HOME=@HOME_DIR@
 Environment=PYTHONUNBUFFERED=1
-Environment=LCD_REFRESH_INTERVAL=5
+Environment=LCD_REFRESH_INTERVAL=1
+Environment=LCD_STATUS_INTERVAL=5
 Environment=SOYSAN_LCD_TIMEZONE=America/New_York
 ExecStartPre=+/usr/sbin/modprobe spidev
 ExecStart=@PROJECT_DIR@/startup/start_if_ready.sh

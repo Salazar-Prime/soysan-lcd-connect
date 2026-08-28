@@ -6,6 +6,9 @@ Install and start the systemd service:
 ./install.sh
 ```
 
+The clock refreshes every second. Network, Internet, and Tailscale status are
+checked every five seconds.
+
 Check it:
 
 ```bash
