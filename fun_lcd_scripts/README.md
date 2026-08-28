@@ -12,7 +12,15 @@ python3 show_image.py ~/Pictures/photo.jpg
 ```
 
 Use `--fit cover` to fill the screen by cropping the edges, or change the
-letterbox color with `--background white`. Restart the status screen afterward:
+letterbox color with `--background white`. Rotate between portrait and landscape
+with a clockwise multiple of 90 degrees:
+
+```bash
+python3 show_image.py ~/Pictures/photo.jpg --rotate 90
+python3 show_image.py ~/Pictures/photo.jpg --rotate -90 --fit cover
+```
+
+Restart the status screen afterward:
 
 ```bash
 sudo systemctl start soysan-lcd.service

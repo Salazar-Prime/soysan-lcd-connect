@@ -14,9 +14,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from lcd_driver import HEIGHT, WIDTH, Waveshare2Inch
 
 
-def resize_image(image: Image.Image, fit: str, background) -> Image.Image:
+def resize_image(
+    image: Image.Image,
+    fit: str,
+    background,
+    rotation: int = 0,
+) -> Image.Image:
     """Orient and fit an image onto the LCD-sized canvas."""
     source = ImageOps.exif_transpose(image).convert("RGBA")
+    if rotation:
+        source = source.rotate(-rotation, expand=True)
     size = (WIDTH, HEIGHT)
 
     if fit == "stretch":
@@ -33,10 +40,15 @@ def resize_image(image: Image.Image, fit: str, background) -> Image.Image:
     return canvas
 
 
-def load_image(path: Path, fit: str, background) -> Image.Image:
+def load_image(
+    path: Path,
+    fit: str,
+    background,
+    rotation: int = 0,
+) -> Image.Image:
     try:
         with Image.open(str(path)) as image:
-            return resize_image(image, fit, background)
+            return resize_image(image, fit, background, rotation)
     except FileNotFoundError:
         raise ValueError(f"image not found: {path}")
     except (OSError, UnidentifiedImageError) as error:
@@ -60,6 +72,16 @@ def parse_color(parser: argparse.ArgumentParser, value: str):
         parser.error(f"invalid background color: {value}")
 
 
+def multiple_of_90(value: str) -> int:
+    try:
+        degrees = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number")
+    if degrees % 90 != 0:
+        raise argparse.ArgumentTypeError("must be a multiple of 90 degrees")
+    return degrees % 360
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -78,6 +100,13 @@ def main() -> None:
         default="black",
         help="letterbox color used with --fit contain (default: black)",
     )
+    parser.add_argument(
+        "--rotate",
+        type=multiple_of_90,
+        default=0,
+        metavar="DEGREES",
+        help="clockwise rotation in multiples of 90 degrees (default: 0)",
+    )
     args = parser.parse_args()
 
     if not Path("/dev/spidev0.0").exists():
@@ -85,7 +114,12 @@ def main() -> None:
 
     background = parse_color(parser, args.background)
     try:
-        image = load_image(args.image.expanduser(), args.fit, background)
+        image = load_image(
+            args.image.expanduser(),
+            args.fit,
+            background,
+            args.rotate,
+        )
     except ValueError as error:
         parser.error(str(error))
 
@@ -100,7 +134,10 @@ def main() -> None:
     try:
         display.initialize()
         display.show(image)
-        print(f"Displayed {args.image} using {args.fit} fit.")
+        print(
+            f"Displayed {args.image} using {args.fit} fit "
+            f"with {args.rotate} degree clockwise rotation."
+        )
     finally:
         display.close()
 
