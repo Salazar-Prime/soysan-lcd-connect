@@ -2,6 +2,27 @@
 
 Small visual experiments for the Soysan LCD.
 
+## Show a video stream
+
+Stream a V4L2 capture device until `Ctrl+C`:
+
+```bash
+sudo systemctl stop soysan-lcd.service
+python3 show_video.py /dev/video0
+```
+
+Rotate a landscape feed or stop automatically after 30 seconds:
+
+```bash
+python3 show_video.py /dev/video0 --rotate 90 --fit contain
+python3 show_video.py /dev/video0 --duration 30
+```
+
+The defaults request 640×480 MJPEG at 30 capture FPS and update the LCD at up
+to 5 FPS. OpenCV is required (`sudo apt install python3-opencv`). Use
+`v4l2-ctl --list-devices` to find capture devices; some adjacent `/dev/video*`
+nodes contain metadata rather than frames.
+
 ## Show an image
 
 Stop the status screen, then pass an image path:
