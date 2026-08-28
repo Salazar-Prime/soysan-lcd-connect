@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import re
 import signal
 import socket
@@ -17,6 +18,10 @@ from PIL import Image, ImageDraw
 
 from lcd_driver import HEIGHT, WIDTH, Waveshare2Inch, load_font
 
+
+os.environ["TZ"] = os.environ.get("SOYSAN_LCD_TIMEZONE", "America/New_York")
+if hasattr(time, "tzset"):
+    time.tzset()
 
 stop_requested = False
 
@@ -216,7 +221,7 @@ def collect_status(internet_timeout: float) -> StatusSnapshot:
         internet_online=internet_online(internet_timeout),
         tailscale_state=tailscale_state,
         tailscale_ip=tailscale_ip,
-        updated_at=datetime.now().strftime("%H:%M:%S"),
+        updated_at=datetime.now().strftime("%I:%M:%S %p %Z"),
     )
 
 
@@ -250,7 +255,7 @@ def render_status(status: StatusSnapshot) -> Image.Image:
     draw.rectangle((0, 0, WIDTH, 58), fill=navy)
     ubuntu = fit_text(draw, status.ubuntu, font_header, WIDTH - 22)
     draw.text((11, 7), ubuntu, fill="white", font=font_header)
-    draw.text((12, 36), "SOYSAN CONNECTION STATUS", fill=(185, 208, 231), font=font_small)
+    draw.text((12, 35), status.updated_at, fill=(185, 208, 231), font=font_body)
 
     draw.rectangle((8, 67, WIDTH - 8, 165), fill="white", outline=border)
     draw.text((18, 75), "NETWORK", fill=muted, font=font_label)
@@ -275,7 +280,7 @@ def render_status(status: StatusSnapshot) -> Image.Image:
     draw.text((37, 253), tailscale_text, fill=(26, 36, 46), font=font_body)
     draw.text((137, 253), status.tailscale_ip, fill=muted, font=font_small)
 
-    footer = f"{status.interface or '--'}  |  updated {status.updated_at}"
+    footer = f"updated {status.updated_at}"
     draw.text((12, 303), fit_text(draw, footer, font_small, WIDTH - 24), fill=muted, font=font_small)
     return image
 
