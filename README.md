@@ -23,7 +23,7 @@ python3 main.py --print-status
 
 - [`test-screen-setup/`](test-screen-setup/) — wiring, SPI setup, verification,
   and color tests.
-- [`fun_lcd_scripts/`](fun_lcd_scripts/) — small visual and message scripts.
+- [`fun_lcd_scripts/`](fun_lcd_scripts/) — display images, visuals, and messages.
 - [`startup/`](startup/) — install or remove the automatic boot service.
 
 `lcd_driver.py` is the shared LCD driver used by all scripts.
