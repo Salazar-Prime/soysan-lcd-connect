@@ -24,6 +24,12 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 stop_requested = False
+WEBSOCKET_PORT = 8765
+MOCKINGBEAT_API_PORT = 3000
+EXPECTED_WEBSOCKET_CLIENTS = (
+    ("mockingbeat", "MOCKING"),
+    ("7empest", "7EMPEST"),
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,8 @@ class StatusSnapshot:
     internet_online: bool
     tailscale_state: str
     tailscale_ip: str
+    websocket_client: str
+    mockingbeat_api_online: bool
     current_time: str
     updated_at: str
 
@@ -190,12 +198,12 @@ def internet_online(timeout: float) -> bool:
 def tailscale_status():
     output = run_command(["tailscale", "status", "--json"], timeout=3.0)
     if not output:
-        return "Unavailable", "--"
+        return "Unavailable", "--", {}
 
     try:
         status = json.loads(output)
     except json.JSONDecodeError:
-        return "Error", "--"
+        return "Error", "--", {}
 
     self_status = status.get("Self") or {}
     addresses = self_status.get("TailscaleIPs") or status.get("TailscaleIPs") or []
@@ -203,17 +211,74 @@ def tailscale_status():
     running = status.get("BackendState") == "Running"
     online = self_status.get("Online", running)
 
+    expected_peers = {}
+    for peer in (status.get("Peer") or {}).values():
+        hostname = (peer.get("HostName") or peer.get("DNSName") or "").strip()
+        short_name = hostname.rstrip(".").split(".", 1)[0].lower()
+        if short_name not in {name for name, _label in EXPECTED_WEBSOCKET_CLIENTS}:
+            continue
+        expected_peers[short_name] = {
+            "addresses": peer.get("TailscaleIPs") or [],
+            "online": bool(peer.get("Online")),
+        }
+
     if running and online:
-        return "Connected", ipv4
+        return "Connected", ipv4, expected_peers
     if running:
-        return "Starting", ipv4
-    return status.get("BackendState") or "Offline", ipv4
+        return "Starting", ipv4, expected_peers
+    return status.get("BackendState") or "Offline", ipv4, expected_peers
+
+
+def endpoint_host(endpoint: str) -> str:
+    if endpoint.startswith("[") and "]" in endpoint:
+        return endpoint[1 : endpoint.index("]")]
+    host, separator, _port = endpoint.rpartition(":")
+    return host if separator else endpoint
+
+
+def websocket_client(expected_peers) -> str:
+    output = run_command(
+        ["ss", "-Htn", "state", "established", f"sport = :{WEBSOCKET_PORT}"]
+    )
+    remote_addresses = {
+        endpoint_host(line.split()[-1])
+        for line in output.splitlines()
+        if line.split()
+    }
+
+    for peer_name, label in EXPECTED_WEBSOCKET_CLIENTS:
+        peer = expected_peers.get(peer_name) or {}
+        if remote_addresses.intersection(peer.get("addresses") or []):
+            return label
+    return "OFF"
+
+
+def tcp_port_online(host: str, port: int, timeout: float) -> bool:
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def collect_status(internet_timeout: float) -> StatusSnapshot:
     mode, connection, interface, local_ip = network_status()
-    tailscale_state, tailscale_ip = tailscale_status()
+    tailscale_state, tailscale_ip, expected_peers = tailscale_status()
     internet_is_online = internet_online(internet_timeout)
+    connected_websocket_client = websocket_client(expected_peers)
+    mockingbeat = expected_peers.get("mockingbeat") or {}
+    mockingbeat_addresses = mockingbeat.get("addresses") or []
+    mockingbeat_ipv4 = next(
+        (address for address in mockingbeat_addresses if ":" not in address),
+        "mockingbeat",
+    )
+    mockingbeat_api_online = tcp_port_online(
+        mockingbeat_ipv4,
+        MOCKINGBEAT_API_PORT,
+        min(internet_timeout, 1.0),
+    )
     timestamp = eastern_timestamp()
     return StatusSnapshot(
         ubuntu=ubuntu_version(),
@@ -224,6 +289,8 @@ def collect_status(internet_timeout: float) -> StatusSnapshot:
         internet_online=internet_is_online,
         tailscale_state=tailscale_state,
         tailscale_ip=tailscale_ip,
+        websocket_client=connected_websocket_client,
+        mockingbeat_api_online=mockingbeat_api_online,
         current_time=timestamp,
         updated_at=timestamp,
     )
@@ -265,28 +332,37 @@ def render_status(status: StatusSnapshot) -> Image.Image:
     draw.text((11, 7), ubuntu, fill="white", font=font_header)
     draw.text((12, 35), status.current_time, fill=(185, 208, 231), font=font_body)
 
-    draw.rectangle((8, 67, WIDTH - 8, 165), fill="white", outline=border)
+    draw.rectangle((8, 67, WIDTH - 8, 138), fill="white", outline=border)
     draw.text((18, 75), "NETWORK", fill=muted, font=font_label)
     mode_color = status_color(status.network_mode != "Disconnected")
     draw.ellipse((18, 99, 28, 109), fill=mode_color)
     draw.text((35, 91), status.network_mode, fill=(26, 36, 46), font=font_value)
-    network_name = fit_text(draw, status.network_name, font_body, WIDTH - 36)
-    draw.text((18, 123), network_name, fill=muted, font=font_body)
-    draw.text((18, 144), f"IP  {status.local_ip}", fill=(26, 36, 46), font=font_body)
+    draw.text((18, 118), f"IP  {status.local_ip}", fill=muted, font=font_body)
 
-    draw.rectangle((8, 174, WIDTH - 8, 219), fill="white", outline=border)
-    draw.text((18, 182), "INTERNET", fill=muted, font=font_label)
-    internet_text = "ONLINE" if status.internet_online else "OFFLINE"
-    draw.ellipse((145, 190, 157, 202), fill=status_color(status.internet_online))
-    draw.text((164, 184), internet_text, fill=(26, 36, 46), font=font_body)
+    draw.rectangle((8, 147, WIDTH - 8, 207), fill="white", outline=border)
+    draw.text((18, 155), "CONNECTIVITY", fill=muted, font=font_label)
+    draw.ellipse((18, 181, 30, 193), fill=status_color(status.internet_online))
+    draw.text((37, 175), "INTERNET", fill=(26, 36, 46), font=font_body)
 
-    draw.rectangle((8, 228, WIDTH - 8, 292), fill="white", outline=border)
-    draw.text((18, 236), "TAILSCALE", fill=muted, font=font_label)
     tailscale_online = status.tailscale_state == "Connected"
-    draw.ellipse((18, 260, 30, 272), fill=status_color(tailscale_online))
-    tailscale_text = fit_text(draw, status.tailscale_state.upper(), font_body, 94)
-    draw.text((37, 253), tailscale_text, fill=(26, 36, 46), font=font_body)
-    draw.text((137, 253), status.tailscale_ip, fill=muted, font=font_small)
+    draw.ellipse((130, 181, 142, 193), fill=status_color(tailscale_online))
+    draw.text((149, 175), "TAILSCALE", fill=(26, 36, 46), font=font_body)
+
+    draw.rectangle((8, 216, WIDTH - 8, 294), fill="white", outline=border)
+    draw.text((18, 224), "SERVICES", fill=muted, font=font_label)
+
+    websocket_online = status.websocket_client != "OFF"
+    draw.text((18, 244), "WS", fill=(26, 36, 46), font=font_body)
+    draw.ellipse((55, 249, 67, 261), fill=status_color(websocket_online))
+    draw.text((75, 243), status.websocket_client, fill=(26, 36, 46), font=font_body)
+
+    draw.text((18, 271), "MB API :3000", fill=(26, 36, 46), font=font_body)
+    draw.ellipse(
+        (136, 276, 148, 288),
+        fill=status_color(status.mockingbeat_api_online),
+    )
+    api_text = "UP" if status.mockingbeat_api_online else "DOWN"
+    draw.text((157, 270), api_text, fill=(26, 36, 46), font=font_body)
 
     footer = f"updated {status.updated_at}"
     draw.text((12, 303), fit_text(draw, footer, font_small, WIDTH - 24), fill=muted, font=font_small)
@@ -373,7 +449,9 @@ def main() -> None:
                 print(
                     f"{status.updated_at} network={status.network_mode} "
                     f"ip={status.local_ip} internet={'online' if status.internet_online else 'offline'} "
-                    f"tailscale={status.tailscale_state} tailscale_ip={status.tailscale_ip}",
+                    f"tailscale={status.tailscale_state} tailscale_ip={status.tailscale_ip} "
+                    f"websocket={status.websocket_client.lower()} "
+                    f"mockingbeat_api={'up' if status.mockingbeat_api_online else 'down'}",
                     flush=True,
                 )
 
