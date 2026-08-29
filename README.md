@@ -4,10 +4,11 @@ Status and utility scripts for the Waveshare 2-inch LCD on the Xavier NX.
 
 ## Main status screen
 
-`main.py` shows Ubuntu, network mode, local IP, Internet and Tailscale status,
-the expected WebSocket client (`MOCKING` or `7EMPEST`), and Mockingbeat API
-port 3000. The Eastern time refreshes every second; status checks refresh every
-five seconds.
+`main.py` shows Eastern time, local and Tailscale IPs, Internet and Tailscale
+health, connected WebSocket devices, and Mockingbeat API port 3000. Fresh drone
+telemetry adds the battery percentage while a recognized WebSocket client is
+connected. The time refreshes every second; status checks refresh every five
+seconds.
 
 ```bash
 ./run_status_display.sh

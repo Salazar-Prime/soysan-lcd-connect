@@ -1,1 +1,2 @@
 spidev==3.8
+websockets==12.0

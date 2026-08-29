@@ -2,19 +2,26 @@
 """Continuously show Soysan connectivity status on the 2-inch LCD."""
 
 import argparse
+import asyncio
 import json
 import os
 import re
 import signal
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
 
 from lcd_driver import HEIGHT, WIDTH, Waveshare2Inch, load_font
 
@@ -26,10 +33,13 @@ if hasattr(time, "tzset"):
 stop_requested = False
 WEBSOCKET_PORT = 8765
 MOCKINGBEAT_API_PORT = 3000
+WEBSOCKET_GRACE_SECONDS = 10.0
+BATTERY_MAX_AGE_SECONDS = 5.0
 EXPECTED_WEBSOCKET_CLIENTS = (
     ("mockingbeat", "MOCKING"),
     ("7empest", "7EMPEST"),
 )
+websocket_client_last_seen = {}
 
 
 @dataclass(frozen=True)
@@ -50,10 +60,135 @@ class StatusSnapshot:
     internet_online: bool
     tailscale_state: str
     tailscale_ip: str
-    websocket_client: str
+    websocket_clients: tuple
     mockingbeat_api_online: bool
+    drone_battery: Optional[int]
     current_time: str
     updated_at: str
+
+
+class DroneBatteryMonitor:
+    """Keep the latest fresh battery value from Soysan's telemetry stream."""
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._tailscale_ip = ""
+        self._battery = None
+        self._battery_updated_at = 0.0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        if websockets is None or self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="soysan-lcd-battery",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=4.0)
+
+    def set_enabled(self, enabled: bool, tailscale_ip: str) -> None:
+        usable_ip = tailscale_ip if tailscale_ip not in {"", "--"} else ""
+        with self._lock:
+            self._enabled = enabled and bool(usable_ip)
+            self._tailscale_ip = usable_ip
+            if not self._enabled:
+                self._battery = None
+                self._battery_updated_at = 0.0
+
+    def battery(self) -> Optional[int]:
+        with self._lock:
+            if not self._enabled or self._battery is None:
+                return None
+            if time.monotonic() - self._battery_updated_at > BATTERY_MAX_AGE_SECONDS:
+                return None
+            return self._battery
+
+    def _connection_state(self):
+        with self._lock:
+            return self._enabled, self._tailscale_ip
+
+    def _set_battery(self, battery) -> None:
+        with self._lock:
+            if battery is None:
+                self._battery = None
+                self._battery_updated_at = 0.0
+                return
+            self._battery = max(0, min(100, int(round(float(battery)))))
+            self._battery_updated_at = time.monotonic()
+
+    def _thread_main(self) -> None:
+        try:
+            asyncio.run(self._run())
+        except Exception as error:
+            print(f"Battery telemetry monitor stopped: {error}", flush=True)
+
+    async def _run(self) -> None:
+        while not self._stop_event.is_set():
+            enabled, tailscale_ip = self._connection_state()
+            if not enabled:
+                await asyncio.sleep(0.5)
+                continue
+
+            try:
+                await self._consume_telemetry(tailscale_ip)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._set_battery(None)
+                await asyncio.sleep(2.0)
+
+    async def _consume_telemetry(self, tailscale_ip: str) -> None:
+        endpoint = (
+            f"ws://[{tailscale_ip}]:{WEBSOCKET_PORT}"
+            if ":" in tailscale_ip
+            else f"ws://{tailscale_ip}:{WEBSOCKET_PORT}"
+        )
+        async with websockets.connect(
+            endpoint,
+            open_timeout=3,
+            close_timeout=1,
+            ping_interval=10,
+            ping_timeout=5,
+        ) as websocket:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "subscribe_telemetry",
+                        "commandId": "lcd-battery-monitor",
+                    }
+                )
+            )
+
+            while not self._stop_event.is_set():
+                enabled, current_ip = self._connection_state()
+                if not enabled or current_ip != tailscale_ip:
+                    self._set_battery(None)
+                    return
+                try:
+                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                try:
+                    message = json.loads(raw_message)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                data = message.get("data") or {}
+                battery = data.get("battery")
+                if (
+                    message.get("type") == "telemetry"
+                    and message.get("aircraftConnected") is True
+                    and isinstance(battery, (int, float))
+                ):
+                    self._set_battery(battery)
 
 
 def run_command(arguments: List[str], timeout: float = 2.0) -> str:
@@ -236,7 +371,7 @@ def endpoint_host(endpoint: str) -> str:
     return host if separator else endpoint
 
 
-def websocket_client(expected_peers) -> str:
+def websocket_clients(expected_peers, now: Optional[float] = None) -> tuple:
     output = run_command(
         ["ss", "-Htn", "state", "established", f"sport = :{WEBSOCKET_PORT}"]
     )
@@ -246,11 +381,21 @@ def websocket_client(expected_peers) -> str:
         if line.split()
     }
 
+    checked_at = time.monotonic() if now is None else now
+    detected = set()
     for peer_name, label in EXPECTED_WEBSOCKET_CLIENTS:
         peer = expected_peers.get(peer_name) or {}
         if remote_addresses.intersection(peer.get("addresses") or []):
-            return label
-    return "OFF"
+            detected.add(label)
+            websocket_client_last_seen[label] = checked_at
+
+    return tuple(
+        label
+        for _peer_name, label in EXPECTED_WEBSOCKET_CLIENTS
+        if label in detected
+        or checked_at - websocket_client_last_seen.get(label, float("-inf"))
+            <= WEBSOCKET_GRACE_SECONDS
+    )
 
 
 def tcp_port_online(host: str, port: int, timeout: float) -> bool:
@@ -263,11 +408,14 @@ def tcp_port_online(host: str, port: int, timeout: float) -> bool:
         return False
 
 
-def collect_status(internet_timeout: float) -> StatusSnapshot:
+def collect_status(
+    internet_timeout: float,
+    drone_battery: Optional[int] = None,
+) -> StatusSnapshot:
     mode, connection, interface, local_ip = network_status()
     tailscale_state, tailscale_ip, expected_peers = tailscale_status()
     internet_is_online = internet_online(internet_timeout)
-    connected_websocket_client = websocket_client(expected_peers)
+    connected_websocket_clients = websocket_clients(expected_peers)
     mockingbeat = expected_peers.get("mockingbeat") or {}
     mockingbeat_addresses = mockingbeat.get("addresses") or []
     mockingbeat_ipv4 = next(
@@ -289,15 +437,16 @@ def collect_status(internet_timeout: float) -> StatusSnapshot:
         internet_online=internet_is_online,
         tailscale_state=tailscale_state,
         tailscale_ip=tailscale_ip,
-        websocket_client=connected_websocket_client,
+        websocket_clients=connected_websocket_clients,
         mockingbeat_api_online=mockingbeat_api_online,
+        drone_battery=drone_battery,
         current_time=timestamp,
         updated_at=timestamp,
     )
 
 
 def eastern_timestamp() -> str:
-    return datetime.now().astimezone().strftime("%I:%M:%S %p %Z")
+    return datetime.now().astimezone().strftime("%I:%M:%S %p")
 
 
 def fit_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:
@@ -310,62 +459,191 @@ def fit_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:
 
 
 def status_color(healthy: bool):
-    return (20, 145, 75) if healthy else (205, 57, 57)
+    return (26, 170, 99) if healthy else (210, 62, 74)
+
+
+def load_data_font(size: int):
+    try:
+        return ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            size,
+        )
+    except OSError:
+        return load_font(size)
+
+
+def draw_right_text(draw, right: int, y: int, text: str, font, fill) -> None:
+    width = draw.textsize(text, font=font)[0]
+    draw.text((right - width, y), text, fill=fill, font=font)
+
+
+def draw_rounded_rectangle(draw, bounds, radius: int, fill, outline=None) -> None:
+    left, top, right, bottom = bounds
+    diameter = radius * 2
+    draw.rectangle((left + radius, top, right - radius, bottom), fill=fill)
+    draw.rectangle((left, top + radius, right, bottom - radius), fill=fill)
+    draw.ellipse((left, top, left + diameter, top + diameter), fill=fill)
+    draw.ellipse((right - diameter, top, right, top + diameter), fill=fill)
+    draw.ellipse((left, bottom - diameter, left + diameter, bottom), fill=fill)
+    draw.ellipse((right - diameter, bottom - diameter, right, bottom), fill=fill)
+    if outline is None:
+        return
+    draw.line((left + radius, top, right - radius, top), fill=outline)
+    draw.line((left + radius, bottom, right - radius, bottom), fill=outline)
+    draw.line((left, top + radius, left, bottom - radius), fill=outline)
+    draw.line((right, top + radius, right, bottom - radius), fill=outline)
+    draw.arc((left, top, left + diameter, top + diameter), 180, 270, fill=outline)
+    draw.arc((right - diameter, top, right, top + diameter), 270, 360, fill=outline)
+    draw.arc((left, bottom - diameter, left + diameter, bottom), 90, 180, fill=outline)
+    draw.arc((right - diameter, bottom - diameter, right, bottom), 0, 90, fill=outline)
+
+
+def draw_status_pill(draw, bounds, label: str, healthy: bool, font) -> None:
+    ink = (31, 45, 59)
+    border = (205, 216, 225)
+    draw_rounded_rectangle(draw, bounds, radius=15, fill="white", outline=border)
+    left, top, _right, _bottom = bounds
+    draw.ellipse((left + 10, top + 9, left + 22, top + 21), fill=status_color(healthy))
+    draw.text((left + 29, top + 6), label, fill=ink, font=font)
+
+
+def draw_phone_icon(draw, x: int, y: int, color) -> None:
+    pale_green = (231, 248, 239)
+    draw_rounded_rectangle(
+        draw,
+        (x, y, x + 15, y + 25),
+        radius=3,
+        fill=pale_green,
+        outline=color,
+    )
+    draw.line((x + 5, y + 4, x + 10, y + 4), fill=color, width=1)
+    draw.ellipse((x + 6, y + 20, x + 9, y + 23), fill=color)
+
+
+def draw_laptop_icon(draw, x: int, y: int, color) -> None:
+    pale_green = (231, 248, 239)
+    draw.rectangle(
+        (x + 2, y, x + 24, y + 16),
+        fill=pale_green,
+        outline=color,
+        width=2,
+    )
+    draw.polygon(
+        ((x, y + 18), (x + 26, y + 18), (x + 22, y + 22), (x + 4, y + 22)),
+        fill=color,
+    )
+
+
+def draw_battery(draw, percentage: int, font) -> None:
+    if percentage > 50:
+        color = (46, 204, 113)
+    elif percentage > 20:
+        color = (242, 169, 59)
+    else:
+        color = (239, 83, 80)
+
+    x, y = 164, 17
+    draw_rounded_rectangle(
+        draw,
+        (x, y, x + 27, y + 16),
+        radius=2,
+        fill=(15, 42, 67),
+        outline=color,
+    )
+    draw.rectangle((x + 28, y + 5, x + 31, y + 11), fill=color)
+    fill_width = int(21 * percentage / 100)
+    if fill_width > 0:
+        draw.rectangle((x + 3, y + 3, x + 3 + fill_width, y + 13), fill=color)
+    draw_right_text(draw, WIDTH - 9, 15, f"{percentage}%", font, "white")
 
 
 def render_status(status: StatusSnapshot) -> Image.Image:
-    background = (241, 244, 247)
-    navy = (20, 48, 80)
-    muted = (91, 104, 118)
-    border = (213, 220, 227)
+    background = (239, 244, 248)
+    navy = (15, 42, 67)
+    ink = (31, 45, 59)
+    muted = (82, 96, 109)
+    border = (205, 216, 225)
 
     image = Image.new("RGB", (WIDTH, HEIGHT), background)
     draw = ImageDraw.Draw(image)
-    font_header = load_font(19)
-    font_label = load_font(12)
-    font_value = load_font(21)
-    font_body = load_font(14)
-    font_small = load_font(11)
+    font_time = load_font(18)
+    font_mode = load_font(17)
+    font_body = load_font(13)
+    font_label = load_font(11)
+    font_small = load_font(10)
+    font_data = load_data_font(12)
 
-    draw.rectangle((0, 0, WIDTH, 58), fill=navy)
-    ubuntu = fit_text(draw, status.ubuntu, font_header, WIDTH - 22)
-    draw.text((11, 7), ubuntu, fill="white", font=font_header)
-    draw.text((12, 35), status.current_time, fill=(185, 208, 231), font=font_body)
+    # Flight-deck strip: time and fresh aircraft battery only.
+    draw.rectangle((0, 0, WIDTH, 49), fill=navy)
+    draw.text((11, 13), status.current_time, fill="white", font=font_time)
+    if status.drone_battery is not None:
+        draw_battery(draw, status.drone_battery, font_body)
 
-    draw.rectangle((8, 67, WIDTH - 8, 138), fill="white", outline=border)
-    draw.text((18, 75), "NETWORK", fill=muted, font=font_label)
-    mode_color = status_color(status.network_mode != "Disconnected")
-    draw.ellipse((18, 99, 28, 109), fill=mode_color)
-    draw.text((35, 91), status.network_mode, fill=(26, 36, 46), font=font_value)
-    draw.text((18, 118), f"IP  {status.local_ip}", fill=muted, font=font_body)
+    # Network identity. The two addresses share one quiet navigation band.
+    draw.rectangle((0, 50, WIDTH, 105), fill="white")
+    draw.text((12, 58), status.network_mode, fill=ink, font=font_mode)
+    draw_right_text(draw, WIDTH - 12, 61, status.local_ip, font_data, ink)
+    draw.line((12, 79, WIDTH - 12, 79), fill=border)
+    draw.text((12, 84), "TAILSCALE IP", fill=muted, font=font_small)
+    draw_right_text(draw, WIDTH - 12, 82, status.tailscale_ip, font_data, muted)
 
-    draw.rectangle((8, 147, WIDTH - 8, 207), fill="white", outline=border)
-    draw.text((18, 155), "CONNECTIVITY", fill=muted, font=font_label)
-    draw.ellipse((18, 181, 30, 193), fill=status_color(status.internet_online))
-    draw.text((37, 175), "INTERNET", fill=(26, 36, 46), font=font_body)
+    draw_status_pill(
+        draw,
+        (8, 113, 113, 143),
+        "Internet",
+        status.internet_online,
+        font_body,
+    )
+    draw_status_pill(
+        draw,
+        (121, 113, WIDTH - 8, 143),
+        "Tailscale",
+        status.tailscale_state == "Connected",
+        font_body,
+    )
 
-    tailscale_online = status.tailscale_state == "Connected"
-    draw.ellipse((130, 181, 142, 193), fill=status_color(tailscale_online))
-    draw.text((149, 175), "TAILSCALE", fill=(26, 36, 46), font=font_body)
+    draw.text((11, 156), "SOYSAN STATUS", fill=muted, font=font_label)
+    draw_rounded_rectangle(
+        draw,
+        (8, 174, WIDTH - 8, 294),
+        radius=6,
+        fill="white",
+        outline=border,
+    )
 
-    draw.rectangle((8, 216, WIDTH - 8, 294), fill="white", outline=border)
-    draw.text((18, 224), "SERVICES", fill=muted, font=font_label)
+    draw.text((18, 187), "WebSocket", fill=ink, font=font_body)
+    clients = set(status.websocket_clients)
+    connected_color = status_color(True)
+    if clients == {"MOCKING", "7EMPEST"}:
+        draw_laptop_icon(draw, 160, 183, connected_color)
+        draw_phone_icon(draw, 207, 181, connected_color)
+    elif "MOCKING" in clients:
+        draw_laptop_icon(draw, 119, 183, connected_color)
+        draw.text((154, 187), "MOCKING", fill=ink, font=font_body)
+    elif "7EMPEST" in clients:
+        draw_phone_icon(draw, 133, 181, connected_color)
+        draw.text((158, 187), "7EMPEST", fill=ink, font=font_body)
+    else:
+        draw.ellipse((174, 190, 186, 202), fill=status_color(False))
+        draw.text((194, 184), "OFF", fill=ink, font=font_body)
 
-    websocket_online = status.websocket_client != "OFF"
-    draw.text((18, 244), "WS", fill=(26, 36, 46), font=font_body)
-    draw.ellipse((55, 249, 67, 261), fill=status_color(websocket_online))
-    draw.text((75, 243), status.websocket_client, fill=(26, 36, 46), font=font_body)
-
-    draw.text((18, 271), "MB API :3000", fill=(26, 36, 46), font=font_body)
+    draw.line((18, 224, WIDTH - 18, 224), fill=border)
+    draw.text((18, 247), "API server", fill=ink, font=font_body)
+    draw.text((91, 249), ":3000", fill=muted, font=font_data)
     draw.ellipse(
-        (136, 276, 148, 288),
+        (171, 252, 183, 264),
         fill=status_color(status.mockingbeat_api_online),
     )
     api_text = "UP" if status.mockingbeat_api_online else "DOWN"
-    draw.text((157, 270), api_text, fill=(26, 36, 46), font=font_body)
+    draw.text((192, 246), api_text, fill=ink, font=font_body)
 
     footer = f"updated {status.updated_at}"
-    draw.text((12, 303), fit_text(draw, footer, font_small, WIDTH - 24), fill=muted, font=font_small)
+    draw.text(
+        (12, 305),
+        fit_text(draw, footer, font_small, WIDTH - 24),
+        fill=muted,
+        font=font_small,
+    )
     return image
 
 
@@ -428,6 +706,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
+    battery_monitor = DroneBatteryMonitor()
+    battery_monitor.start()
     display = Waveshare2Inch()
     try:
         display.initialize()
@@ -439,10 +719,21 @@ def main() -> None:
             started = time.monotonic()
             status_refreshed = status is None or started >= next_status_refresh
             if status_refreshed:
-                status = collect_status(args.internet_timeout)
+                status = collect_status(
+                    args.internet_timeout,
+                    drone_battery=battery_monitor.battery(),
+                )
+                battery_monitor.set_enabled(
+                    bool(status.websocket_clients),
+                    status.tailscale_ip,
+                )
                 next_status_refresh = started + args.status_interval
             else:
-                status = replace(status, current_time=eastern_timestamp())
+                status = replace(
+                    status,
+                    current_time=eastern_timestamp(),
+                    drone_battery=battery_monitor.battery(),
+                )
 
             display.show(render_status(status))
             if status_refreshed:
@@ -450,8 +741,9 @@ def main() -> None:
                     f"{status.updated_at} network={status.network_mode} "
                     f"ip={status.local_ip} internet={'online' if status.internet_online else 'offline'} "
                     f"tailscale={status.tailscale_state} tailscale_ip={status.tailscale_ip} "
-                    f"websocket={status.websocket_client.lower()} "
-                    f"mockingbeat_api={'up' if status.mockingbeat_api_online else 'down'}",
+                    f"websocket={','.join(client.lower() for client in status.websocket_clients) or 'off'} "
+                    f"mockingbeat_api={'up' if status.mockingbeat_api_online else 'down'} "
+                    f"battery={status.drone_battery if status.drone_battery is not None else '--'}",
                     flush=True,
                 )
 
@@ -460,6 +752,7 @@ def main() -> None:
             elapsed = time.monotonic() - started
             time.sleep(max(0.1, args.interval - elapsed))
     finally:
+        battery_monitor.stop()
         display.close()
 
 
