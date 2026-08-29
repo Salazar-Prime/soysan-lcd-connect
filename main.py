@@ -221,6 +221,8 @@ def drone_display_name(value) -> str:
     if not isinstance(value, str) or not value.strip():
         return "DRONE"
     raw_name = value.strip()
+    if re.search(r"\bPM430\b", raw_name, re.IGNORECASE):
+        return "M300 RTK"
     model_code = re.search(r"\b(PM\d+)\b", raw_name, re.IGNORECASE)
     return model_code.group(1).upper() if model_code else raw_name
 
