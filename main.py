@@ -727,6 +727,7 @@ def main() -> None:
                     bool(status.websocket_clients),
                     status.tailscale_ip,
                 )
+                status = replace(status, drone_battery=battery_monitor.battery())
                 next_status_refresh = started + args.status_interval
             else:
                 status = replace(
