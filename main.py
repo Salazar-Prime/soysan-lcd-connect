@@ -62,19 +62,21 @@ class StatusSnapshot:
     tailscale_ip: str
     websocket_clients: tuple
     mockingbeat_api_online: bool
+    drone_name: Optional[str]
     drone_battery: Optional[int]
     current_time: str
-    updated_at: str
+    updated_at: float
 
 
-class DroneBatteryMonitor:
-    """Keep the latest fresh battery value from Soysan's telemetry stream."""
+class DroneTelemetryMonitor:
+    """Keep the latest fresh aircraft identity and battery telemetry."""
 
     def __init__(self) -> None:
         self._enabled = False
         self._tailscale_ip = ""
+        self._drone_name = None
         self._battery = None
-        self._battery_updated_at = 0.0
+        self._telemetry_updated_at = 0.0
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
@@ -84,7 +86,7 @@ class DroneBatteryMonitor:
             return
         self._thread = threading.Thread(
             target=self._thread_main,
-            name="soysan-lcd-battery",
+            name="soysan-lcd-telemetry",
             daemon=True,
         )
         self._thread.start()
@@ -100,35 +102,38 @@ class DroneBatteryMonitor:
             self._enabled = enabled and bool(usable_ip)
             self._tailscale_ip = usable_ip
             if not self._enabled:
+                self._drone_name = None
                 self._battery = None
-                self._battery_updated_at = 0.0
+                self._telemetry_updated_at = 0.0
 
-    def battery(self) -> Optional[int]:
+    def telemetry(self):
         with self._lock:
-            if not self._enabled or self._battery is None:
-                return None
-            if time.monotonic() - self._battery_updated_at > BATTERY_MAX_AGE_SECONDS:
-                return None
-            return self._battery
+            if not self._enabled or self._battery is None or self._drone_name is None:
+                return None, None
+            if time.monotonic() - self._telemetry_updated_at > BATTERY_MAX_AGE_SECONDS:
+                return None, None
+            return self._drone_name, self._battery
 
     def _connection_state(self):
         with self._lock:
             return self._enabled, self._tailscale_ip
 
-    def _set_battery(self, battery) -> None:
+    def _set_telemetry(self, drone_name, battery) -> None:
         with self._lock:
-            if battery is None:
+            if drone_name is None or battery is None:
+                self._drone_name = None
                 self._battery = None
-                self._battery_updated_at = 0.0
+                self._telemetry_updated_at = 0.0
                 return
+            self._drone_name = drone_name
             self._battery = max(0, min(100, int(round(float(battery)))))
-            self._battery_updated_at = time.monotonic()
+            self._telemetry_updated_at = time.monotonic()
 
     def _thread_main(self) -> None:
         try:
             asyncio.run(self._run())
         except Exception as error:
-            print(f"Battery telemetry monitor stopped: {error}", flush=True)
+            print(f"Drone telemetry monitor stopped: {error}", flush=True)
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -142,7 +147,7 @@ class DroneBatteryMonitor:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._set_battery(None)
+                self._set_telemetry(None, None)
                 await asyncio.sleep(2.0)
 
     async def _consume_telemetry(self, tailscale_ip: str) -> None:
@@ -162,7 +167,7 @@ class DroneBatteryMonitor:
                 json.dumps(
                     {
                         "type": "subscribe_telemetry",
-                        "commandId": "lcd-battery-monitor",
+                        "commandId": "lcd-drone-status",
                     }
                 )
             )
@@ -170,7 +175,7 @@ class DroneBatteryMonitor:
             while not self._stop_event.is_set():
                 enabled, current_ip = self._connection_state()
                 if not enabled or current_ip != tailscale_ip:
-                    self._set_battery(None)
+                    self._set_telemetry(None, None)
                     return
                 try:
                     raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
@@ -188,7 +193,10 @@ class DroneBatteryMonitor:
                     and message.get("aircraftConnected") is True
                     and isinstance(battery, (int, float))
                 ):
-                    self._set_battery(battery)
+                    self._set_telemetry(
+                        drone_display_name(message.get("droneModel")),
+                        battery,
+                    )
 
 
 def run_command(arguments: List[str], timeout: float = 2.0) -> str:
@@ -204,6 +212,17 @@ def run_command(arguments: List[str], timeout: float = 2.0) -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def drone_display_name(value) -> str:
+    configured_name = os.environ.get("SOYSAN_DRONE_NAME", "").strip()
+    if configured_name:
+        return configured_name
+    if not isinstance(value, str) or not value.strip():
+        return "DRONE"
+    raw_name = value.strip()
+    model_code = re.search(r"\b(PM\d+)\b", raw_name, re.IGNORECASE)
+    return model_code.group(1).upper() if model_code else raw_name
 
 
 def ubuntu_version() -> str:
@@ -410,6 +429,7 @@ def tcp_port_online(host: str, port: int, timeout: float) -> bool:
 
 def collect_status(
     internet_timeout: float,
+    drone_name: Optional[str] = None,
     drone_battery: Optional[int] = None,
 ) -> StatusSnapshot:
     mode, connection, interface, local_ip = network_status()
@@ -439,14 +459,23 @@ def collect_status(
         tailscale_ip=tailscale_ip,
         websocket_clients=connected_websocket_clients,
         mockingbeat_api_online=mockingbeat_api_online,
+        drone_name=drone_name,
         drone_battery=drone_battery,
         current_time=timestamp,
-        updated_at=timestamp,
+        updated_at=time.monotonic(),
     )
 
 
 def eastern_timestamp() -> str:
     return datetime.now().astimezone().strftime("%I:%M:%S %p")
+
+
+def relative_update_age(updated_at: float, now: Optional[float] = None) -> str:
+    checked_at = time.monotonic() if now is None else now
+    seconds = max(0, int(checked_at - updated_at))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    return f"{seconds // 60}m ago"
 
 
 def fit_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:
@@ -534,6 +563,23 @@ def draw_laptop_icon(draw, x: int, y: int, color) -> None:
     )
 
 
+def draw_drone_icon(draw, x: int, y: int, color, disconnected: bool = False) -> None:
+    draw.line((x + 8, y + 7, x + 25, y + 18), fill=color, width=2)
+    draw.line((x + 25, y + 7, x + 8, y + 18), fill=color, width=2)
+    draw.ellipse((x, y + 3, x + 12, y + 7), outline=color)
+    draw.ellipse((x + 21, y + 3, x + 33, y + 7), outline=color)
+    draw.ellipse((x, y + 18, x + 12, y + 22), outline=color)
+    draw.ellipse((x + 21, y + 18, x + 33, y + 22), outline=color)
+    draw_rounded_rectangle(
+        draw,
+        (x + 11, y + 8, x + 22, y + 17),
+        radius=2,
+        fill=color,
+    )
+    if disconnected:
+        draw.line((x - 1, y + 23, x + 34, y), fill=color, width=3)
+
+
 def draw_battery(draw, percentage: int, font) -> None:
     if percentage > 50:
         color = (46, 204, 113)
@@ -566,18 +612,34 @@ def render_status(status: StatusSnapshot) -> Image.Image:
 
     image = Image.new("RGB", (WIDTH, HEIGHT), background)
     draw = ImageDraw.Draw(image)
-    font_time = load_font(18)
+    font_drone = load_font(14)
     font_mode = load_font(17)
     font_body = load_font(13)
     font_label = load_font(11)
     font_small = load_font(10)
     font_data = load_data_font(12)
 
-    # Flight-deck strip: time and fresh aircraft battery only.
+    # Flight-deck strip: live aircraft identity or an explicit disconnected state.
     draw.rectangle((0, 0, WIDTH, 49), fill=navy)
-    draw.text((11, 13), status.current_time, fill="white", font=font_time)
-    if status.drone_battery is not None:
+    if status.drone_name is not None and status.drone_battery is not None:
+        draw_drone_icon(draw, 10, 13, status_color(True))
+        drone_name = fit_text(
+            draw,
+            status.drone_name.upper(),
+            font_drone,
+            108,
+        )
+        draw.text((49, 14), drone_name, fill="white", font=font_drone)
         draw_battery(draw, status.drone_battery, font_body)
+    else:
+        disconnected_color = (239, 83, 80)
+        draw_drone_icon(draw, 10, 13, disconnected_color, disconnected=True)
+        draw.text(
+            (50, 14),
+            "DRONE DISCONNECTED",
+            fill=(255, 202, 201),
+            font=font_drone,
+        )
 
     # Network identity. The two addresses share one quiet navigation band.
     draw.rectangle((0, 50, WIDTH, 105), fill="white")
@@ -637,13 +699,9 @@ def render_status(status: StatusSnapshot) -> Image.Image:
     api_text = "UP" if status.mockingbeat_api_online else "DOWN"
     draw.text((192, 246), api_text, fill=ink, font=font_body)
 
-    footer = f"updated {status.updated_at}"
-    draw.text(
-        (12, 305),
-        fit_text(draw, footer, font_small, WIDTH - 24),
-        fill=muted,
-        font=font_small,
-    )
+    draw.text((12, 305), status.current_time, fill=muted, font=font_small)
+    footer = f"updated {relative_update_age(status.updated_at)}"
+    draw_right_text(draw, WIDTH - 12, 305, footer, font_small, muted)
     return image
 
 
@@ -706,8 +764,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
 
-    battery_monitor = DroneBatteryMonitor()
-    battery_monitor.start()
+    telemetry_monitor = DroneTelemetryMonitor()
+    telemetry_monitor.start()
     display = Waveshare2Inch()
     try:
         display.initialize()
@@ -719,31 +777,41 @@ def main() -> None:
             started = time.monotonic()
             status_refreshed = status is None or started >= next_status_refresh
             if status_refreshed:
+                drone_name, drone_battery = telemetry_monitor.telemetry()
                 status = collect_status(
                     args.internet_timeout,
-                    drone_battery=battery_monitor.battery(),
+                    drone_name=drone_name,
+                    drone_battery=drone_battery,
                 )
-                battery_monitor.set_enabled(
+                telemetry_monitor.set_enabled(
                     bool(status.websocket_clients),
                     status.tailscale_ip,
                 )
-                status = replace(status, drone_battery=battery_monitor.battery())
+                drone_name, drone_battery = telemetry_monitor.telemetry()
+                status = replace(
+                    status,
+                    drone_name=drone_name,
+                    drone_battery=drone_battery,
+                )
                 next_status_refresh = started + args.status_interval
             else:
+                drone_name, drone_battery = telemetry_monitor.telemetry()
                 status = replace(
                     status,
                     current_time=eastern_timestamp(),
-                    drone_battery=battery_monitor.battery(),
+                    drone_name=drone_name,
+                    drone_battery=drone_battery,
                 )
 
             display.show(render_status(status))
             if status_refreshed:
                 print(
-                    f"{status.updated_at} network={status.network_mode} "
+                    f"{status.current_time} network={status.network_mode} "
                     f"ip={status.local_ip} internet={'online' if status.internet_online else 'offline'} "
                     f"tailscale={status.tailscale_state} tailscale_ip={status.tailscale_ip} "
                     f"websocket={','.join(client.lower() for client in status.websocket_clients) or 'off'} "
                     f"mockingbeat_api={'up' if status.mockingbeat_api_online else 'down'} "
+                    f"drone={status.drone_name or '--'} "
                     f"battery={status.drone_battery if status.drone_battery is not None else '--'}",
                     flush=True,
                 )
@@ -753,7 +821,7 @@ def main() -> None:
             elapsed = time.monotonic() - started
             time.sleep(max(0.1, args.interval - elapsed))
     finally:
-        battery_monitor.stop()
+        telemetry_monitor.stop()
         display.close()
 
 
